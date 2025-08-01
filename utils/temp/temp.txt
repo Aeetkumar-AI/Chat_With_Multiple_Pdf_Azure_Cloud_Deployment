@@ -1,0 +1,241 @@
+def determine_severity(summary, description, acceptance_criteria, domain):
+    prompt = f"""
+You are an Information Security Risk Evaluator for financial services infrastructure.
+
+*DOMAIN ANALYSIS:* {domain}
+
+*RISK ASSESSMENT CRITERIA:*
+
+*Change Type Classification:*
+- *Major*: New implementations, architectural changes, platform migrations, regulatory compliance changes, decommissioning
+- *Minor*: Updates to existing systems, configuration tweaks, routine maintenance, incremental changes
+
+*Domain-Specific Risk Assessment:*
+
+{get_domain_risk_matrix(domain)}
+
+*Severity Scoring Framework (1-10):*
+
+*Critical Risk Indicators (8-10):*
+- New authentication platform setup
+- Cryptographic key generation/deletion
+- System-to-system authentication implementation
+- Migration to cloud platforms
+- Application re-architecting
+- HSM setup/changes
+- VPN implementation
+- Internet-facing application changes
+- SOX/OCC application changes
+- Application decommissioning
+
+*High Risk Indicators (6-7):*
+- Changes to existing authentication platforms
+- SSL certificate changes
+- MFA setup/changes
+- Database/transit encryption changes
+- API gateway setup/changes
+- Functional ID setup/modification
+- Application/server/middleware updates
+- Regulatory compliance implementations
+
+*Medium Risk Indicators (4-5):*
+- User role changes
+- Incremental platform changes
+- Configuration changes in servers
+- Software patch deployments
+- Session management updates
+- EERS feed updates
+- VPN changes
+
+*Low Risk Indicators (1-3):*
+- New user creation (standard process)
+- Minor application changes
+- Logging mechanism changes
+- Documentation updates
+- Routine certificate renewals
+
+*Financial Services Context Multipliers:*
+- SOX compliance: +2 severity
+- PCI compliance: +2 severity  
+- HIPAA compliance: +1 severity
+- Production data involved: +1 severity
+- Customer-facing systems: +1 severity
+- ATM/IVR systems: +2 severity
+- Mainframe changes: +2 severity
+
+*Effort Assessment Guidelines:*
+- *High Effort* (typically higher risk): New implementations, migrations, architectural changes
+- *Medium Effort* (moderate risk): Updates, modifications, configuration changes  
+- *Low Effort* (typically lower risk): User management, routine maintenance, patches
+
+*Analysis Process:*
+1. Identify the specific subcategory within {domain}
+2. Assess change type (Major vs Minor)
+3. Apply base severity from domain risk matrix
+4. Add financial services context multipliers
+5. Consider effort/complexity indicators
+6. Determine final score and recommendation
+
+*Story to Analyze:*
+Summary: {summary}
+Description: {description}
+Acceptance Criteria: {acceptance_criteria}
+Domain: {domain}
+
+*Required Response Format:*
+{{
+  "change_type": "Major or Minor",
+  "severity_score": [1-10 integer],
+  "severity_label": "Low/Medium/High/Critical", 
+  "recommendation": "Auto-Approve or Needs Review",
+  "subcategory_identified": "specific subcategory from domain list",
+  "risk_factors_identified": ["list of identified risk factors"],
+  "reasoning": "Brief explanation linking subcategory to severity score"
+}}
+
+*Important*: Match the story to specific subcategories in the domain list above, then apply the corresponding risk level.
+"""
+
+def get_domain_risk_matrix(domain):
+    domain_matrices = {
+        "Identification/Authentication/Authorization/Access Control/Entitlement": """
+*Base Severity by Subcategory:*
+- New user creation: 2-3 (Low)
+- Changes to existing users: 3-4 (Low-Medium)
+- New bot user creation: 4-5 (Medium)
+- Changes to existing bot users: 3-4 (Low-Medium)
+- Application role changes: 5-6 (Medium-High)
+- New-setup changes to shared authentication platforms: 8-9 (High-Critical)
+- Incremental changes to shared authentication platforms: 5-6 (Medium-High)
+- New-setup/mapping changes to shared directories: 7-8 (High)
+- Incremental changes to shared directories: 4-5 (Medium)
+- New-setup changes to custom authentication solutions: 7-8 (High)
+- Incremental changes to custom authentication solutions: 5-6 (Medium-High)
+- Changes to multi-factor authentication (MFA): 6-7 (Medium-High)
+- New hardware/software token mechanism implementation: 7-8 (High)
+- Changes to existing hardware/software token mechanisms: 5-6 (Medium-High)
+- New-setup to authentication PIN mechanisms: 6-7 (Medium-High)
+- Changes to authentication PIN mechanisms: 4-5 (Medium)
+- New-setup to knowledge-based authentication: 6-7 (Medium-High)
+- Changes to knowledge-based authentication: 4-5 (Medium)
+- System to system authentication implementation: 8-9 (High-Critical)
+        """,
+        
+        "Data Security/Cryptography": """
+*Base Severity by Subcategory:*
+- Cryptographic key generation, renewal, deletion, modifications: 8-10 (High-Critical)
+- Changes to cryptographic libraries: 7-8 (High)
+- SSL certificate creation: 5-6 (Medium-High)
+- SSL certificate changes: 4-5 (Medium)
+- Digital signatures updates: 6-7 (Medium-High)
+- Hash function updates: 6-7 (Medium-High)
+- Database/transit encryption setup changes: 7-8 (High)
+- Database/transit encryption changes: 5-6 (Medium-High)
+- Data masking: 4-5 (Medium)
+- Obfuscation requirements: 4-5 (Medium)
+- Hardware Security Module (HSM) setup: 9-10 (Critical)
+- Hardware Security Module (HSM) changes: 7-8 (High)
+- Password-based encryption updates: 5-6 (Medium-High)
+- Data migration from production to non-prod: 6-7 (Medium-High)
+- Change in information classification: 5-6 (Medium-High)
+- Key distribution updates: 7-8 (High)
+        """,
+        
+        "Application Security": """
+*Base Severity by Subcategory:*
+- New application (web, desktop, mobile): 6-7 (Medium-High)
+- Changed application (web, desktop, mobile): 4-5 (Medium)
+- Application/server/middleware deployment: 6-7 (Medium-High)
+- Application/server/middleware updates: 4-5 (Medium)
+- Configuration changes in servers: 4-5 (Medium)
+- Technology changes in servers: 6-7 (Medium-High)
+- Migration to cloud platforms (SaaS, PaaS, IaaS): 8-9 (High-Critical)
+- Software patch deployments: 3-4 (Low-Medium)
+- Application re-architecting: 8-9 (High-Critical)
+- Logging mechanism changes: 3-4 (Low-Medium)
+- Session management updates: 5-6 (Medium-High)
+- SMS setup changes: 4-5 (Medium)
+- File upload setup changes: 5-6 (Medium-High)
+- Regulatory compliance (PCI, SOX, HIPAA): 7-8 (High)
+- AI/ML integration: 6-7 (Medium-High)
+- Blockchain integration: 7-8 (High)
+- New application/API interfaces: 6-7 (Medium-High)
+- Changed application/API interfaces: 4-5 (Medium)
+- Gateway (API/payment) setup: 7-8 (High)
+- Gateway (API/payment) changes: 5-6 (Medium-High)
+- Application decommissioning: 8-9 (High-Critical)
+        """,
+        
+        "Administrative Security": """
+*Base Severity by Subcategory:*
+- Functional ID setup or modification: 6-7 (Medium-High)
+- Functional ID modification: 5-6 (Medium-High)
+- Maker/checker functionality changes: 5-6 (Medium-High)
+- Delegation admin actions: 4-5 (Medium)
+- Entitlement admin actions: 5-6 (Medium-High)
+- EERS feed setup: 5-6 (Medium-High)
+- EERS feed updates: 3-4 (Low-Medium)
+        """,
+        
+        "Network & Perimeter Security": """
+*Base Severity by Subcategory:*
+- VPN implementation: 8-9 (High-Critical)
+- VPN changes: 5-6 (Medium-High)
+- Deployment in demilitarized zone (DMZ): 7-8 (High)
+- Application architecture changes: 7-8 (High)
+        """,
+        
+        "Vulnerability Assessment": """
+*Base Severity by Subcategory:*
+- Internet-facing app/component updates: 7-8 (High)
+- ATM/IVR app changes: 8-9 (High-Critical)
+- SOX/OCC WP application changes: 8-9 (High-Critical)
+        """
+    }
+    
+    return domain_matrices.get(domain, """
+*General Assessment:*
+- Assess based on security impact and business criticality
+- Consider regulatory implications
+- Evaluate technical complexity and risk exposure
+    """)
+
+# Updated function with your domain structure
+def determine_severity_with_domain_mapping(summary, description, acceptance_criteria, domain):
+    prompt = create_domain_specific_prompt(summary, description, acceptance_criteria, domain)
+    
+    try:
+        response = generate_content(prompt)
+        result = json.loads(response.text)
+        
+        # Enhanced validation
+        required_fields = ["change_type", "severity_score", "severity_label", "recommendation", "subcategory_identified"]
+        if not all(field in result for field in required_fields):
+            raise ValueError("Missing required fields in LLM response")
+            
+        severity_score = int(result.get("severity_score", 5))
+        if not 1 <= severity_score <= 10:
+            severity_score = 5  # Default to medium if out of range
+            
+        return {
+            "change_type": result.get("change_type", "Unknown"),
+            "severity_score": severity_score,
+            "severity_label": result.get("severity_label", "Medium"),
+            "recommendation": result.get("recommendation", "Needs Review"),
+            "subcategory": result.get("subcategory_identified", "Unknown"),
+            "risk_factors": result.get("risk_factors_identified", []),
+            "reasoning": result.get("reasoning", "Assessment based on domain analysis")
+        }
+        
+    except Exception as e:
+        print(f"Error in severity assessment: {e}")
+        # Conservative fallback
+        return {
+            "change_type": "Unknown",
+            "severity_score": 5,
+            "severity_label": "Medium", 
+            "recommendation": "Needs Review",
+            "subcategory": "Unable to determine",
+            "risk_factors": ["Assessment error"],
+            "reasoning": "Error occurred during assessment, defaulting to conservative evaluation"
+        }

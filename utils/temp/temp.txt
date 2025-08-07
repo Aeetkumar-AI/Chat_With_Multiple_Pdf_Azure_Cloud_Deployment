@@ -1,0 +1,148 @@
+import os
+import atexit
+import tempfile
+import streamlit as st
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_core.tools import Tool
+from langgraph.graph import StateGraph
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain.prompts import ChatPromptTemplate
+from typing import Annotated, TypedDict
+
+from vertex_langchain import VertexClientLLM, VertexClientEmbeddings
+from citi_ciso_vertex_client import ChatVertexAI
+from utils import load_secrets, authenticate  # Optional if you already have it
+
+# ---- Constants ----
+EXPERIMENT_NAME = "rag_faiss"
+FAISS_INDEX_DIR = "faiss_index"
+os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+load_dotenv()
+
+# ---- Vertex AI Setup ----
+client_llm = VertexClientLLM()
+embeddings = VertexClientEmbeddings(client=client_llm)
+
+vertex_client = authenticate()
+llm = ChatVertexAI(
+    vertex_client=vertex_client,
+    project=os.environ["GCP_PROJECT"],
+    mode_name=os.environ["MODEL_NAME"],
+    base_url=os.environ["VERTEX_URL"],
+    location=os.environ["GCP_LOCATION"],
+)
+
+# ---- LangGraph State ----
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+# ---- Streamlit UI ----
+st.title("🧠 Agentic RAG with FAISS + Vertex AI using LangGraph")
+
+# ---- File Upload ----
+st.header("📄 Upload a Document")
+uploaded_file = st.file_uploader("Upload a .pdf or .txt file", type=["pdf", "txt"])
+
+if uploaded_file:
+    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        temp_file.write(uploaded_file.read())
+        file_path = temp_file.name
+        atexit.register(lambda: os.remove(file_path) if os.path.exists(file_path) else None)
+
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
+    if ext == ".pdf":
+        loader = PyPDFLoader(file_path)
+    elif ext == ".txt":
+        loader = TextLoader(file_path)
+    else:
+        st.error("Unsupported file format.")
+        st.stop()
+
+    docs = loader.load_and_split()
+    doc_text = "\n".join([page.page_content for page in docs])
+    st.success("📄 Document loaded!")
+
+    # ---- Chunk and Embed ----
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = text_splitter.split_text(doc_text)
+
+    if st.button("📦 Process & Embed"):
+        with st.spinner("Creating embeddings and saving to FAISS..."):
+            faiss_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
+            faiss_store.save_local(FAISS_INDEX_DIR)
+            st.success("✅ Saved to FAISS!")
+
+# ---- Agentic RAG using LangGraph ----
+st.header("🤖 Ask a Question")
+user_query = st.text_input("Your question")
+
+if user_query and st.button("💬 Get Answer"):
+    with st.spinner("Thinking..."):
+
+        # Load FAISS
+        faiss_store = FAISS.load_local(
+            FAISS_INDEX_DIR,
+            embeddings=embeddings,
+            allow_dangerous_deserialization=True
+        )
+        retriever = faiss_store.as_retriever(search_kwargs={"k": 3})
+
+        # Tool: RAG Retriever
+        def get_rag_chunks(query):
+            docs = retriever.get_relevant_documents(query)
+            return "\n".join(doc.page_content for doc in docs)
+
+        rag_tool = Tool(
+            name="RAG_Retriever",
+            func=get_rag_chunks,
+            description="Retrieve relevant context from uploaded documents."
+        )
+
+        # Prompt + Tool Binding
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful assistant. Use tools if relevant."),
+            ("placeholder", "{messages}")
+        ])
+        llm_with_tools = prompt | llm.bind_tools([rag_tool])
+
+        # LangGraph nodes
+        def chatbot_node(state: State):
+            return {"messages": [llm_with_tools.invoke(state)]}
+
+        rag_node = ToolNode(tools=[rag_tool])
+
+        def route_tools(state: State):
+            tool_calls = state["messages"][-1].tool_calls
+            if not tool_calls:
+                return "END"
+            return [call["name"] for call in tool_calls]
+
+        # Build LangGraph
+        builder = StateGraph(State)
+        builder.set_entry_point("chatbot")
+        builder.add_node("chatbot", chatbot_node)
+        builder.add_node("RAG_Retriever", rag_node)
+        builder.add_conditional_edges("chatbot", route_tools)
+        builder.add_edge("RAG_Retriever", "chatbot")
+
+        memory = InMemorySaver()
+        graph = builder.compile(checkpointer=memory)
+
+        # Run LangGraph
+        config = {"configurable": {"thread_id": "agentic_faiss_rag"}}
+        events = graph.stream({"messages": [("user", user_query)]}, config, stream_mode="values")
+
+        final_output = None
+        for event in events:
+            msg = event.get("messages")
+            if msg:
+                final_output = msg[-1].content
+        if final_output:
+            st.subheader("🧠 Answer")
+            st.write(final_output)

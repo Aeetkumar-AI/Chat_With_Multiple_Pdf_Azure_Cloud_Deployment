@@ -1,0 +1,420 @@
+import atexit
+import os
+import tempfile
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from vertex_langchain import VertexClientLLM, VertexClientEmbeddings
+import re
+from typing import List, Dict, Set
+import hashlib
+
+# -----------------------------
+# Load environment and secrets
+# -----------------------------
+load_dotenv()
+from utils import load_secrets, authenticate
+load_secrets()
+
+# -----------------------------
+# Constants
+# -----------------------------
+FAISS_INDEX_DIR = "faiss_index"
+METADATA_CACHE = "processed_files.txt"
+
+os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+
+# -----------------------------
+# Initialize Vertex clients
+# -----------------------------
+client = VertexClientLLM()
+embeddings = VertexClientEmbeddings(client)
+
+# -----------------------------
+# File Hash Management
+# -----------------------------
+def get_processed_files() -> Set[str]:
+    """Reads the set of processed file hashes from the cache."""
+    if not os.path.exists(METADATA_CACHE):
+        return set()
+    with open(METADATA_CACHE, "r") as f:
+        return set(line.strip() for line in f)
+
+def add_to_processed_files(file_hash: str):
+    """Adds a new file hash to the cache."""
+    with open(METADATA_CACHE, "a") as f:
+        f.write(f"{file_hash}\n")
+
+def get_file_hash(file_content: bytes) -> str:
+    """Generates a SHA256 hash for file content."""
+    return hashlib.sha256(file_content).hexdigest()
+
+# -----------------------------
+# Enhanced Markdown Processing
+# -----------------------------
+class PCMMarkdownProcessor:
+    """Enhanced processor for PCM Markdown documents"""
+    
+    @staticmethod
+    def extract_document_structure(md_text: str) -> Dict:
+        """Extract hierarchical structure from markdown"""
+        lines = md_text.split('\n')
+        structure = {
+            'title': '',
+            'sections': [],
+            'current_section': None,
+            'current_subsection': None
+        }
+        
+        for line in lines:
+            # Extract title (# Header)
+            if line.startswith('# ') and not structure['title']:
+                structure['title'] = line[2:].strip()
+            # Extract sections (## Header)
+            elif line.startswith('## '):
+                structure['current_section'] = line[3:].strip()
+                structure['sections'].append(structure['current_section'])
+            # Extract subsections (### Header)
+            elif line.startswith('### '):
+                structure['current_subsection'] = line[4:].strip()
+        
+        return structure
+    
+    @staticmethod
+    def convert_md_tables_to_structured_text(md_text: str) -> str:
+        """
+        Enhanced table conversion with better semantic preservation
+        """
+        # Find all markdown tables
+        table_pattern = r'(\|.+?\|(?:\n\|[-:\s]+\|)+\n(?:\|.*\|)+)'
+        tables = re.findall(table_pattern, md_text, flags=re.DOTALL)
+        
+        for table in tables:
+            rows = [r.strip() for r in table.strip().split('\n') if r.strip()]
+            
+            # Parse headers
+            headers = [h.strip() for h in rows[0].split('|') if h.strip()]
+            
+            # Skip separator row (row with dashes)
+            data_rows = rows[2:]
+            
+            # Build structured text representation
+            table_text = "\n[TABLE START]\n"
+            table_text += f"Columns: {', '.join(headers)}\n"
+            
+            for idx, row in enumerate(data_rows, 1):
+                values = [v.strip() for v in row.split('|') if v.strip()]
+                if len(values) == len(headers):
+                    row_dict = dict(zip(headers, values))
+                    table_text += f"Row {idx}: " + " | ".join(
+                        f"{k}={v}" for k, v in row_dict.items()
+                    ) + "\n"
+            
+            table_text += "[TABLE END]\n"
+            md_text = md_text.replace(table, table_text)
+        
+        return md_text
+    
+    @staticmethod
+    def add_contextual_metadata(chunks: List[str], structure: Dict, 
+                                 doc_name: str) -> List[Document]:
+        """
+        Add rich metadata to chunks for better context preservation
+        """
+        documents = []
+        current_section = structure.get('title', 'Unknown')
+        
+        for i, chunk in enumerate(chunks):
+            # Try to infer section from chunk content
+            section_match = re.search(r'##\s+(.+?)(?:\n|$)', chunk)
+            if section_match:
+                current_section = section_match.group(1).strip()
+            
+            metadata = {
+                'source': doc_name,
+                'chunk_id': i,
+                'section': current_section,
+                'doc_title': structure.get('title', doc_name),
+                'char_count': len(chunk)
+            }
+            
+            documents.append(Document(page_content=chunk, metadata=metadata))
+        
+        return documents
+
+# -----------------------------
+# Streamlit Page
+# -----------------------------
+st.set_page_config(page_title="RAG PCM Assistant", layout="wide")
+st.title("🔍 Enhanced RAG Pipeline for PCM Documents")
+st.markdown("*Process Control Manual Knowledge Retrieval System*")
+
+# Sidebar for configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    chunk_size = st.slider("Chunk Size", 400, 1000, 700)
+    chunk_overlap = st.slider("Chunk Overlap", 50, 200, 150)
+    retrieval_k = st.slider("Number of Retrieved Chunks", 3, 10, 5)
+    
+    st.markdown("---")
+    st.markdown("### 📊 Index Statistics")
+    if os.path.exists(FAISS_INDEX_DIR):
+        st.success("✅ FAISS Index exists")
+        processed_count = len(get_processed_files())
+        st.info(f"📄 {processed_count} file(s) processed")
+    else:
+        st.warning("⚠️ No index found")
+    
+    st.markdown("---")
+    if st.button("🗑️ Clear Index & Cache"):
+        if os.path.exists(FAISS_INDEX_DIR):
+            import shutil
+            shutil.rmtree(FAISS_INDEX_DIR)
+        if os.path.exists(METADATA_CACHE):
+            os.remove(METADATA_CACHE)
+        st.success("✅ Index and cache cleared!")
+        st.rerun()
+
+# -----------------------------
+# File Upload Section
+# -----------------------------
+st.header("📄 Upload Markdown Documents")
+
+processor = PCMMarkdownProcessor()
+uploaded_files = st.file_uploader(
+    "Choose Markdown file(s)", 
+    type=["md"], 
+    accept_multiple_files=True
+)
+
+if uploaded_files:
+    st.success(f"✅ {len(uploaded_files)} file(s) uploaded")
+    
+    # Display file names
+    with st.expander("📋 Uploaded Files"):
+        for file in uploaded_files:
+            st.write(f"- {file.name}")
+
+    # -----------------------------
+    # Process Documents with Deduplication
+    # -----------------------------
+    if st.button("🚀 Process Documents and Build/Update Index"):
+        all_new_documents = []
+        processed_files_cache = get_processed_files()
+        new_files_processed = 0
+        skipped_files = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for idx, uploaded_file in enumerate(uploaded_files):
+            # Read content and calculate hash
+            file_content = uploaded_file.getvalue()
+            file_hash = get_file_hash(file_content)
+            
+            # Check if file already processed
+            if file_hash in processed_files_cache:
+                status_text.text(f"⏭️ Skipping {uploaded_file.name} (already processed)")
+                skipped_files.append(uploaded_file.name)
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+                continue
+            
+            # File is new, process it
+            status_text.text(f"🔄 Processing {uploaded_file.name}...")
+            new_files_processed += 1
+            
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(
+                delete=False, 
+                suffix=f"_{uploaded_file.name}"
+            ) as temp_file:
+                temp_file.write(file_content)
+                file_path = temp_file.name
+            
+            # Register cleanup
+            atexit.register(
+                lambda p=file_path: os.remove(p) if os.path.exists(p) else None
+            )
+            
+            # Decode content to text
+            md_text = file_content.decode("utf-8")
+            
+            # Extract structure
+            structure = processor.extract_document_structure(md_text)
+            
+            # Convert tables
+            md_text = processor.convert_md_tables_to_structured_text(md_text)
+            
+            # Enhanced chunking with semantic awareness
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""],
+                length_function=len,
+            )
+            
+            chunks = text_splitter.split_text(md_text)
+            
+            # Add metadata
+            docs = processor.add_contextual_metadata(
+                chunks, 
+                structure, 
+                uploaded_file.name
+            )
+            
+            all_new_documents.extend(docs)
+            
+            # Mark file as processed
+            add_to_processed_files(file_hash)
+            
+            progress_bar.progress((idx + 1) / len(uploaded_files))
+        
+        # Build or update FAISS index only if there are new documents
+        if all_new_documents:
+            status_text.text(f"💾 Adding {len(all_new_documents)} new chunks to FAISS index...")
+            
+            if os.path.exists(FAISS_INDEX_DIR):
+                # Load existing index and add new documents
+                faiss_store = FAISS.load_local(
+                    FAISS_INDEX_DIR, 
+                    embeddings, 
+                    allow_dangerous_deserialization=True
+                )
+                faiss_store.add_documents(all_new_documents)
+            else:
+                # Create new index
+                faiss_store = FAISS.from_documents(all_new_documents, embeddings)
+            
+            faiss_store.save_local(FAISS_INDEX_DIR)
+            
+            success_msg = f"✅ Processed {new_files_processed} new document(s) and added {len(all_new_documents)} chunks!"
+            if skipped_files:
+                success_msg += f"\n\n⏭️ Skipped {len(skipped_files)} already-processed file(s):"
+                for fname in skipped_files:
+                    success_msg += f"\n  • {fname}"
+            st.success(success_msg)
+        else:
+            st.info("ℹ️ All uploaded documents have already been processed. Index is up to date.")
+        
+        status_text.empty()
+        progress_bar.empty()
+
+# -----------------------------
+# Question Answering Section
+# -----------------------------
+st.header("❓ Ask Questions About Your PCMs")
+
+col1, col2 = st.columns([3, 1])
+
+with col1:
+    user_query = st.text_input(
+        "Your Question:",
+        placeholder="e.g., What are the quality control procedures for product testing?"
+    )
+
+with col2:
+    st.markdown("### Quick Examples")
+    if st.button("📋 Show example queries"):
+        st.info("""
+        - What are the validation steps?
+        - List all compliance requirements
+        - Explain the monitoring process
+        - What are the reporting procedures?
+        """)
+
+if user_query and st.button("🔍 Get Answer", type="primary"):
+    if not os.path.exists(FAISS_INDEX_DIR):
+        st.error("⚠️ No FAISS index found. Please process documents first.")
+    else:
+        with st.spinner("🔄 Searching knowledge base..."):
+            # Load FAISS store
+            faiss_store = FAISS.load_local(
+                FAISS_INDEX_DIR, 
+                embeddings, 
+                allow_dangerous_deserialization=True
+            )
+            
+            # Retrieve relevant chunks
+            results = faiss_store.similarity_search_with_score(
+                user_query, 
+                k=retrieval_k
+            )
+        
+        if results:
+            # Prepare context with metadata
+            context_parts = []
+            sources = []
+            
+            for i, (doc, score) in enumerate(results):
+                source_info = f"[{doc.metadata.get('source', 'Unknown')} - {doc.metadata.get('section', 'N/A')}]"
+                context_parts.append(f"{source_info}\n{doc.page_content}")
+                sources.append({
+                    'source': doc.metadata.get('source', 'Unknown'),
+                    'section': doc.metadata.get('section', 'N/A'),
+                    'similarity': f"{(1-score)*100:.1f}%"
+                })
+            
+            context = "\n\n---\n\n".join(context_parts)
+            
+            # Enhanced prompt for better answer generation
+            prompt = f"""You are an expert PCM (Process Control Manual) analyst. Answer the following question based on the provided context from multiple PCM documents.
+
+Question: {user_query}
+
+Context from PCM documents:
+{context}
+
+Instructions:
+1. Provide a comprehensive answer synthesizing information from all relevant PCM sections
+2. If the question involves procedures, provide step-by-step details
+3. If tables are mentioned, extract and present the data clearly
+4. Understand implied context and PCM-specific terminology
+5. Cross-reference information from multiple sections when applicable
+6. Cite sources using the format [Document Name - Section]
+7. If information is incomplete or unclear, state this explicitly
+8. Maintain accuracy - do not infer information not present in the context
+
+Answer:"""
+            
+            with st.spinner("🤔 Generating answer..."):
+                answer = client(prompt)
+            
+            # Display answer
+            st.subheader("💡 Answer:")
+            st.markdown(answer)
+            
+            # Display sources
+            st.subheader("📚 Sources Referenced:")
+            for i, source in enumerate(sources, 1):
+                st.markdown(
+                    f"*{i}.* {source['source']} - Section: {source['section']} "
+                    f"(Relevance: {source['similarity']})"
+                )
+            
+            # Show retrieved chunks in expander
+            with st.expander("🔍 View Retrieved Chunks"):
+                for i, (doc, score) in enumerate(results, 1):
+                    st.markdown(f"### Chunk {i}")
+                    st.markdown(f"*Source:* {doc.metadata.get('source', 'Unknown')}")
+                    st.markdown(f"*Section:* {doc.metadata.get('section', 'N/A')}")
+                    st.markdown(f"*Relevance Score:* {(1-score)*100:.1f}%")
+                    st.text_area(
+                        f"Content {i}", 
+                        doc.page_content, 
+                        height=150,
+                        key=f"chunk_{i}"
+                    )
+                    st.markdown("---")
+        else:
+            st.warning("⚠️ No relevant information found. Try rephrasing your question.")
+
+# Footer
+st.markdown("---")
+st.markdown(
+    "<div style='text-align: center; color: gray;'>"
+    "Enhanced RAG Pipeline for PCM Knowledge Retrieval v2.1 - With Deduplication"
+    "</div>", 
+    unsafe_allow_html=True
+)

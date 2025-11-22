@@ -1,0 +1,336 @@
+from langchain.schema import Document, SystemMessage, HumanMessage
+import json
+import re
+
+def agentic_chunking_with_metadata(text, llm, source_file):
+    """
+    Dynamically splits text into meaningful chunks using LLM.
+    
+    Args:
+        text: Document text to chunk
+        llm: LangChain LLM instance
+        source_file: Path to source file
+        
+    Returns:
+        List of Document objects with content and basic metadata
+    """
+    
+    system_message = SystemMessage(content=CHUNKING_SYSTEM_PROMPT)
+    
+    human_message = HumanMessage(content=f"""
+Document to chunk:
+
+{text}
+""")
+    
+    try:
+        # Get LLM response
+        response = llm.invoke([system_message, human_message])
+        
+        # Extract content from response
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        
+        # Clean response (remove markdown code blocks)
+        response_text = response_text.strip()
+        if response_text.startswith('```json'):
+            response_text = response_text[7:]
+        elif response_text.startswith('```'):
+            response_text = response_text[3:]
+        if response_text.endswith('```'):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        
+        # Fix common JSON issues
+        response_text = fix_json_escaping(response_text)
+        
+        # Parse JSON response
+        parsed_response = json.loads(response_text)
+        
+        # Handle both dict and list responses
+        if isinstance(parsed_response, dict):
+            chunks_data = parsed_response.get("chunks", [])
+            doc_metadata = parsed_response.get("document_metadata", {})
+        elif isinstance(parsed_response, list):
+            chunks_data = parsed_response
+            doc_metadata = {}
+        else:
+            raise ValueError("Unexpected response format")
+        
+        # Create Document objects
+        documents = []
+        for chunk_data in chunks_data:
+            if isinstance(chunk_data, dict):
+                content = chunk_data.get("content", "")
+                chunk_id = chunk_data.get("chunk_id", len(documents) + 1)
+                chunk_metadata = chunk_data.get("metadata", {})
+            else:
+                content = str(chunk_data)
+                chunk_id = len(documents) + 1
+                chunk_metadata = {}
+            
+            # Skip empty chunks
+            if not content.strip():
+                continue
+            
+            # Create simplified metadata
+            metadata = {
+                "source": source_file,
+                "chunk_id": chunk_id,
+                **chunk_metadata
+            }
+            
+            # Create Document object
+            doc = Document(
+                page_content=content,
+                metadata=metadata
+            )
+            documents.append(doc)
+        
+        print(f"✅ Successfully chunked into {len(documents)} chunks from {source_file}")
+        return documents
+        
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON Error: {e}")
+        print(f"Response preview: {response_text[:500]}")
+        
+        # Try to extract chunks manually from malformed JSON
+        try:
+            documents = extract_chunks_from_malformed_json(response_text, source_file)
+            if documents:
+                print(f"⚠️ Recovered {len(documents)} chunks from malformed JSON")
+                return documents
+        except:
+            pass
+        
+        # Fallback: split by double newlines with better logic
+        chunks = smart_fallback_chunking(text)
+        documents = []
+        for i, chunk in enumerate(chunks):
+            doc = Document(
+                page_content=chunk,
+                metadata={
+                    "source": source_file,
+                    "chunk_id": i + 1,
+                    "chunk_type": "fallback"
+                }
+            )
+            documents.append(doc)
+        
+        print(f"⚠️ Fallback chunking: Created {len(documents)} chunks")
+        return documents
+        
+    except Exception as e:
+        print(f"❌ Error during chunking: {e}")
+        # Return original document as single chunk
+        return [Document(
+            page_content=text,
+            metadata={
+                "source": source_file,
+                "chunk_id": 1,
+                "chunk_type": "error_fallback"
+            }
+        )]
+
+
+def fix_json_escaping(json_text):
+    """
+    Fix common JSON escaping issues from LLM responses.
+    """
+    # This is a complex fix - we need to be careful not to break valid escapes
+    
+    # Strategy: Use regex to find string values and fix backslashes within them
+    # This is tricky because we need to handle nested structures
+    
+    # Simple approach: try to fix the most common issues
+    try:
+        # First attempt: parse as-is
+        json.loads(json_text)
+        return json_text  # If it works, return it
+    except json.JSONDecodeError:
+        pass
+    
+    # Fix common escape issues in content fields
+    # Look for patterns like "content": "..." and fix backslashes
+    def fix_content_escapes(match):
+        content = match.group(1)
+        # Replace single backslashes with double backslashes
+        # But be careful not to double-escape already escaped sequences
+        content = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', content)
+        return f'"content": "{content}"'
+    
+    # Fix content fields
+    json_text = re.sub(
+        r'"content":\s*"((?:[^"\\]|\\.)*)"',
+        fix_content_escapes,
+        json_text,
+        flags=re.DOTALL
+    )
+    
+    return json_text
+
+
+def extract_chunks_from_malformed_json(response_text, source_file):
+    """
+    Try to extract chunks from malformed JSON using regex.
+    """
+    documents = []
+    
+    # Pattern to extract chunk_id and content
+    pattern = r'"chunk_id":\s*(\d+),\s*"content":\s*"((?:[^"\\]|\\.)*)"'
+    
+    matches = re.finditer(pattern, response_text, re.DOTALL)
+    
+    for match in matches:
+        chunk_id = int(match.group(1))
+        content = match.group(2)
+        
+        # Unescape basic sequences
+        content = content.replace('\\n', '\n')
+        content = content.replace('\\t', '\t')
+        content = content.replace('\\"', '"')
+        content = content.replace('\\\\', '\\')
+        
+        if content.strip():
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "source": source_file,
+                    "chunk_id": chunk_id,
+                    "chunk_type": "recovered"
+                }
+            )
+            documents.append(doc)
+    
+    return documents
+
+
+def smart_fallback_chunking(text, max_chunk_size=600):
+    """
+    Smarter fallback chunking that respects sections and paragraphs.
+    """
+    chunks = []
+    
+    # Split by double newlines first (paragraphs)
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    
+    current_chunk = []
+    current_size = 0
+    
+    for para in paragraphs:
+        para_words = len(para.split())
+        
+        # If adding this paragraph exceeds max size, start new chunk
+        if current_size + para_words > max_chunk_size and current_chunk:
+            chunks.append('\n\n'.join(current_chunk))
+            current_chunk = [para]
+            current_size = para_words
+        else:
+            current_chunk.append(para)
+            current_size += para_words
+    
+    # Add remaining chunk
+    if current_chunk:
+        chunks.append('\n\n'.join(current_chunk))
+    
+    return chunks
+
+
+# =====================================================
+# PROCESS ALL DOCUMENTS WITH PROGRESS
+# =====================================================
+
+from tqdm import tqdm
+
+# Initialize LLM
+llm = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0)
+
+# Process all loaded documents with progress bar
+chunked_docs = []
+failed_docs = []
+
+for i, d in enumerate(tqdm(docs, desc="Processing documents"), 1):
+    try:
+        file_content = d.page_content
+        source_file = d.metadata.get("source", f"unknown_source_{i}")
+        
+        print(f"\n📄 [{i}/{len(docs)}] Processing: {source_file}")
+        
+        chunks = agentic_chunking_with_metadata(
+            text=file_content,
+            llm=llm,
+            source_file=source_file
+        )
+        chunked_docs.extend(chunks)
+        
+    except Exception as e:
+        print(f"❌ Failed to process document {i}: {e}")
+        failed_docs.append((i, source_file, str(e)))
+        continue
+
+print(f"\n{'='*60}")
+print(f"🎉 Processing Complete!")
+print(f"{'='*60}")
+print(f"✅ Total chunks created: {len(chunked_docs)}")
+print(f"📚 Documents processed: {len(docs)}")
+print(f"❌ Failed documents: {len(failed_docs)}")
+
+if failed_docs:
+    print(f"\n⚠️ Failed Documents:")
+    for idx, source, error in failed_docs:
+        print(f"  {idx}. {source}: {error[:100]}")
+
+# =====================================================
+# CREATE VECTOR STORE
+# =====================================================
+
+if chunked_docs:
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_documents(chunked_docs, embeddings)
+    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 7})
+    
+    print(f"\n✅ Vector store created successfully!")
+    print(f"📊 Total vectors: {len(chunked_docs)}")
+else:
+    print(f"\n❌ No chunks created - cannot create vector store")
+
+# =====================================================
+# SETUP RAG CHAIN
+# =====================================================
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert GCM (Global Compliance Monitoring) and PCM (Process Controls Manual) analyst with comprehensive knowledge of GIAM Operations, security report reconciliation, escalation procedures, and compliance monitoring processes.
+
+Instructions for Expert Analysis:
+1. Provide comprehensive answers synthesizing all relevant information
+2. Include specific step-by-step procedures when applicable
+3. Extract and present table data with clear formatting
+4. Reference specific sections and document sources when available
+5. Use clear, concise language with no unnecessary jargon
+6. Ensure all answers are actionable and directly address the question asked
+
+Answer in a clear, actionable format that directly addresses the user's question:"""),
+    ("human", "Context:\n{context}\n\nQuestion: {question}")
+])
+
+def run(query):
+    """Run query against vector store"""
+    docs = retriever.invoke(query)
+    context = "\n\n".join([doc.page_content for doc in docs])
+    
+    chain = prompt | llm
+    inputs = {
+        "context": context,
+        "question": query
+    }
+    
+    response = chain.invoke(inputs)
+    
+    # Print sources
+    print("\n📚 Sources:")
+    for i, doc in enumerate(docs[:5], 1):
+        source = doc.metadata.get("source", "Unknown")
+        chunk_id = doc.metadata.get("chunk_id", "?")
+        chunk_type = doc.metadata.get("chunk_type", "normal")
+        print(f"{i}. {source.split('/')[-1]} (Chunk {chunk_id}) [{chunk_type}]")
+    
+    return response.content if hasattr(response, 'content') else response

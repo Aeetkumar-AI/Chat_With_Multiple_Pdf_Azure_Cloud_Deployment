@@ -1,0 +1,310 @@
+from langchain_community.vectorstores import FAISS
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+import re
+
+# ============================================================================
+# 1. LOAD OR CREATE FAISS VECTORSTORE
+# ============================================================================
+
+# Option A: Create new vectorstore
+# vectorstore = FAISS.from_documents(chunked_docs, embeddings)
+# vectorstore.save_local("faiss_index_new")
+
+# Option B: Load existing vectorstore
+from vertex_langchain import VertexClientEmbeddings
+
+embeddings = VertexClientEmbeddings()
+vectorstore = FAISS.load_local(
+    "faiss_index_new", 
+    embeddings, 
+    allow_dangerous_deserialization=True
+)
+
+# ============================================================================
+# 2. CREATE HYBRID RETRIEVER (FAISS + BM25 ENSEMBLE)
+# ============================================================================
+
+def create_hybrid_retriever(vectorstore, chunked_docs, k=10):
+    """
+    Creates an ensemble retriever combining FAISS (semantic) and BM25 (keyword).
+    
+    Args:
+        vectorstore: FAISS vectorstore
+        chunked_docs: List of Document objects used to create vectorstore
+        k: Number of documents to retrieve
+    
+    Returns:
+        EnsembleRetriever combining both methods
+    """
+    # FAISS retriever (semantic search)
+    faiss_retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": k,
+            "fetch_k": k * 2,  # Fetch more for MMR diversity
+            "lambda_mult": 0.7  # Balance between relevance and diversity
+        }
+    )
+    
+    # BM25 retriever (keyword search)
+    bm25_retriever = BM25Retriever.from_documents(chunked_docs)
+    bm25_retriever.k = k
+    
+    # Ensemble retriever (combines both)
+    # Weights: 0.5 = equal weight, adjust as needed
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[faiss_retriever, bm25_retriever],
+        weights=[0.6, 0.4]  # 60% FAISS, 40% BM25
+    )
+    
+    return ensemble_retriever
+
+# Create the hybrid retriever
+hybrid_retriever = create_hybrid_retriever(vectorstore, chunked_docs, k=10)
+
+# ============================================================================
+# 3. ENHANCED PROMPT WITH FORMATTING INSTRUCTIONS
+# ============================================================================
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert GCM (Global Compliance Monitoring) and PCM (Process Controls Manual) analyst with comprehensive knowledge of GIAM Operations.
+
+**Your Role:**
+Provide clear, well-structured answers based on the provided context from GCM/PCM documentation.
+
+**Formatting Requirements:**
+
+1. **For Revision History or Tables:**
+   - Present as a clean, readable table
+   - Use proper markdown table format
+   - Include headers: Version | Date | Description | Reviewed By
+   - Ensure columns are properly aligned
+   - Add blank lines before and after tables
+
+2. **For Step-by-Step Procedures:**
+   - Use numbered lists (1., 2., 3.)
+   - Include sub-steps with letters (a., b., c.) or bullets
+   - Bold key action items
+
+3. **For General Information:**
+   - Use clear paragraphs with proper spacing
+   - Bold section headings
+   - Use bullet points for lists
+   - Add line breaks between sections
+
+4. **Always Include:**
+   - Document version and date when available
+   - Specific PCM section references
+   - Any relevant compliance notes or warnings
+
+5. **Format HTML/XML Tags:**
+   - Replace <br> with actual line breaks
+   - Remove HTML tags like <br>, <br/>, <br >
+   - Present clean, readable text
+
+**Example of Good Formatting:**
+
+**Revision History**
+
+| Version | Date       | Description                        | Reviewed By  |
+|---------|------------|------------------------------------|--------------|
+| 3.1     | 8/30/2024  | Annual Review                      | John Smith   |
+| 3.0     | 3/25/2025  | Updated compliance procedures      | Jane Doe     |
+
+**Key Changes in Version 3.1:**
+- Removed information related to decommissioned LPAR(s)
+- Updated SAL Uploader link
+- Changed TAC/Compliance to CISO GIAM R&C Advocacy Management
+
+Now answer the question based on the context provided."""),
+    
+    ("human", """**Context from GCM/PCM Knowledge Base:**
+
+{context}
+
+---
+
+**Question:** {question}
+
+**Instructions:** Provide a clear, well-formatted answer following the formatting requirements above.""")
+])
+
+# ============================================================================
+# 4. POST-PROCESSING FUNCTION TO CLEAN RESPONSE
+# ============================================================================
+
+def format_response(raw_response):
+    """
+    Cleans and formats the LLM response for better readability.
+    
+    Args:
+        raw_response: Raw text from LLM
+    
+    Returns:
+        Formatted, human-readable text
+    """
+    # Remove HTML tags
+    response = re.sub(r'<br\s*/?>', '\n', raw_response)
+    response = re.sub(r'<[^>]+>', '', response)
+    
+    # Fix excessive whitespace
+    response = re.sub(r'\n{3,}', '\n\n', response)
+    response = re.sub(r' {2,}', ' ', response)
+    
+    # Ensure proper table formatting
+    # If response contains pipe characters, it's likely a table
+    if '|' in response:
+        lines = response.split('\n')
+        formatted_lines = []
+        in_table = False
+        
+        for line in lines:
+            if '|' in line:
+                if not in_table:
+                    # Add blank line before table
+                    if formatted_lines and formatted_lines[-1].strip():
+                        formatted_lines.append('')
+                    in_table = True
+                
+                # Clean up table row
+                cells = [cell.strip() for cell in line.split('|')]
+                formatted_line = '| ' + ' | '.join(c for c in cells if c) + ' |'
+                formatted_lines.append(formatted_line)
+            else:
+                if in_table and line.strip():
+                    # Add blank line after table
+                    formatted_lines.append('')
+                    in_table = False
+                formatted_lines.append(line)
+        
+        response = '\n'.join(formatted_lines)
+    
+    # Clean up extra spaces around punctuation
+    response = re.sub(r'\s+([.,;:!?])', r'\1', response)
+    
+    return response.strip()
+
+# ============================================================================
+# 5. MAIN RUN FUNCTION WITH HYBRID RETRIEVAL
+# ============================================================================
+
+def run(query, use_hybrid=True, verbose=False):
+    """
+    Run query with hybrid retrieval and formatted response.
+    
+    Args:
+        query: User question
+        use_hybrid: If True, use ensemble retriever; if False, use FAISS only
+        verbose: If True, print retrieved documents
+    
+    Returns:
+        Formatted response string
+    """
+    from vertex_langchain import VertexClientEmbeddings
+    from api.model import initialize_llm
+    
+    # Initialize
+    llm = initialize_llm()
+    embeddings = VertexClientEmbeddings()
+    
+    # Choose retriever
+    if use_hybrid:
+        retriever = hybrid_retriever
+        if verbose:
+            print("Using hybrid retrieval (FAISS + BM25)")
+    else:
+        retriever = vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 10}
+        )
+        if verbose:
+            print("Using FAISS retrieval only")
+    
+    # Retrieve documents
+    docs = retriever.invoke(query)
+    
+    if verbose:
+        print(f"\nRetrieved {len(docs)} documents")
+        for i, doc in enumerate(docs[:3], 1):
+            print(f"\nDoc {i} preview: {doc.page_content[:200]}...")
+    
+    # Prepare context
+    context = "\n\n---\n\n".join([doc.page_content for doc in docs])
+    
+    # Create chain
+    chain = prompt | llm | StrOutputParser()
+    
+    # Invoke
+    inputs = {
+        "context": context,
+        "question": query
+    }
+    
+    raw_response = chain.invoke(inputs)
+    
+    # Format response
+    formatted_response = format_response(raw_response)
+    
+    return formatted_response
+
+# ============================================================================
+# 6. ENHANCED RUN WITH MARKDOWN TABLE RENDERING
+# ============================================================================
+
+def run_with_display(query, use_hybrid=True):
+    """
+    Run query and display with proper markdown rendering.
+    """
+    from IPython.display import display, Markdown
+    
+    response = run(query, use_hybrid=use_hybrid, verbose=False)
+    
+    # Display as rendered markdown in Jupyter
+    display(Markdown(response))
+    
+    return response
+
+# ============================================================================
+# 7. USAGE EXAMPLES
+# ============================================================================
+
+# Example 1: Basic usage with hybrid retrieval
+print("\n" + "="*80)
+print("QUERY: What is the revision history of Mainframe RACF documents?")
+print("="*80 + "\n")
+
+response = run("What is the revision history of Mainframe RACF documents?", use_hybrid=True)
+print(response)
+
+# Example 2: With Jupyter markdown rendering
+# run_with_display("What is the revision history of Mainframe RACF documents?")
+
+# Example 3: Comparison - FAISS only vs Hybrid
+print("\n" + "="*80)
+print("COMPARISON: FAISS vs Hybrid")
+print("="*80 + "\n")
+
+query = "What are the escalation procedures for security violations?"
+
+print("--- FAISS ONLY ---")
+response_faiss = run(query, use_hybrid=False)
+print(response_faiss)
+
+print("\n--- HYBRID (FAISS + BM25) ---")
+response_hybrid = run(query, use_hybrid=True)
+print(response_hybrid)
+
+# Example 4: Verbose mode to see retrieved docs
+print("\n" + "="*80)
+print("VERBOSE MODE")
+print("="*80 + "\n")
+
+response = run(
+    "What is the revision history of Mainframe RACF documents?",
+    use_hybrid=True,
+    verbose=True
+)
+print("\n" + response)

@@ -1,0 +1,291 @@
+import glob
+import os
+from langchain_community.document_loaders import UnstructuredMarkdownLoader
+from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
+# ============================================================================
+# SETUP SPLITTERS
+# ============================================================================
+
+headers_to_split_on = [
+    ("#", "Header 1"),
+    ("##", "Header 2"),
+    ("###", "Header 3"),
+    ("####", "Header 4"),
+    ("#####", "Header 5"),
+    ("######", "Header 6"),
+]
+
+markdown_splitter = MarkdownHeaderTextSplitter(
+    headers_to_split_on=headers_to_split_on,
+    strip_headers=False
+)
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1500,
+    chunk_overlap=200,
+    length_function=len,
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
+
+# ============================================================================
+# LOAD AND PROCESS ALL MARKDOWN FILES
+# ============================================================================
+
+all_chunks = []
+file_count = 0
+
+for file in glob.glob(os.path.join("Doc", "*.md")):
+    print(f"Processing: {file}")
+    
+    # Load the file
+    loader = UnstructuredMarkdownLoader(file)
+    docs = loader.load()
+    
+    # Extract text content from documents
+    for doc in docs:
+        file_count += 1
+        text_content = doc.page_content
+        
+        # Split by markdown headers
+        md_splits = markdown_splitter.split_text(text_content)
+        
+        # Further split large sections
+        for md_doc in md_splits:
+            if len(md_doc.page_content) > 1500:
+                sub_chunks = text_splitter.split_documents([md_doc])
+                for chunk in sub_chunks:
+                    # Add source file to metadata
+                    chunk.metadata['source_file'] = os.path.basename(file)
+                    chunk.metadata['full_path'] = file
+                all_chunks.extend(sub_chunks)
+            else:
+                # Add source file to metadata
+                md_doc.metadata['source_file'] = os.path.basename(file)
+                md_doc.metadata['full_path'] = file
+                all_chunks.append(md_doc)
+
+print(f"\n{'='*80}")
+print(f"✓ Processed {file_count} files")
+print(f"✓ Created {len(all_chunks)} total chunks")
+print(f"{'='*80}\n")
+
+
+
+
+
+
+
+
+import glob
+import os
+import re
+from langchain_community.document_loaders import UnstructuredMarkdownLoader
+from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import FAISS
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+DOC_FOLDER = "Doc"  # Your folder containing .md files
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 200
+
+# ============================================================================
+# SETUP SPLITTERS
+# ============================================================================
+
+headers_to_split_on = [
+    ("#", "Header 1"),
+    ("##", "Header 2"),
+    ("###", "Header 3"),
+    ("####", "Header 4"),
+    ("#####", "Header 5"),
+    ("######", "Header 6"),
+]
+
+markdown_splitter = MarkdownHeaderTextSplitter(
+    headers_to_split_on=headers_to_split_on,
+    strip_headers=False
+)
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
+    length_function=len,
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
+
+# ============================================================================
+# METADATA ENRICHMENT FUNCTIONS
+# ============================================================================
+
+def extract_timeframes(text):
+    """Extract business day timeframes"""
+    timeframe_pattern = r'(\d+)\s*business\s*days?'
+    matches = re.findall(timeframe_pattern, text, re.IGNORECASE)
+    return [int(m) for m in matches] if matches else []
+
+def extract_escalation_level(text):
+    """Extract escalation levels"""
+    levels = []
+    if re.search(r'\bIC\b', text):
+        levels.append('IC')
+    for i in range(1, 5):
+        if re.search(rf'\bESC{i}\b', text):
+            levels.append(f'ESC{i}')
+    return levels
+
+def extract_ticket_types(text):
+    """Extract ticket types"""
+    ticket_types = []
+    patterns = ['INC', 'MIM', 'CHG', 'CMP', 'OST', 'SLTN', 'ResolveIT', 'ServiceNow']
+    for ticket_type in patterns:
+        if ticket_type in text:
+            ticket_types.append(ticket_type)
+    return ticket_types
+
+def enrich_chunk_metadata(chunk, source_file):
+    """Add comprehensive metadata to a chunk"""
+    content = chunk.page_content
+    
+    # Source information
+    chunk.metadata['source_file'] = source_file
+    chunk.metadata['chunk_length'] = len(content)
+    
+    # Content type detection
+    chunk.metadata['section_type'] = 'general'
+    if 'escalation' in content.lower():
+        chunk.metadata['section_type'] = 'escalation'
+    elif 'ticket' in content.lower():
+        chunk.metadata['section_type'] = 'ticket_management'
+    elif 'reconcil' in content.lower():
+        chunk.metadata['section_type'] = 'reconciliation'
+    elif 'procedure' in content.lower():
+        chunk.metadata['section_type'] = 'procedure'
+    
+    # Structural features
+    chunk.metadata['contains_table'] = '|' in content
+    chunk.metadata['contains_list'] = ('* ' in content or '- ' in content)
+    chunk.metadata['contains_file_path'] = ('file:///' in content or '\\\\' in content)
+    
+    # Extract specific information
+    chunk.metadata['timeframes'] = extract_timeframes(content)
+    chunk.metadata['escalation_levels'] = extract_escalation_level(content)
+    chunk.metadata['ticket_types'] = extract_ticket_types(content)
+    
+    # Key indicators
+    chunk.metadata['requires_approval'] = 'approval' in content.lower()
+    chunk.metadata['has_deadline'] = bool(chunk.metadata['timeframes'])
+    
+    return chunk
+
+# ============================================================================
+# LOAD AND PROCESS ALL FILES
+# ============================================================================
+
+all_chunks = []
+file_list = glob.glob(os.path.join(DOC_FOLDER, "*.md"))
+
+print(f"Found {len(file_list)} markdown files\n")
+
+for file_path in file_list:
+    filename = os.path.basename(file_path)
+    print(f"Processing: {filename}")
+    
+    try:
+        # Load the markdown file
+        loader = UnstructuredMarkdownLoader(file_path)
+        docs = loader.load()
+        
+        # Process each document from the file
+        for doc in docs:
+            text_content = doc.page_content
+            
+            # Split by markdown headers
+            try:
+                md_splits = markdown_splitter.split_text(text_content)
+            except Exception as e:
+                print(f"  Warning: Header splitting failed for {filename}, using original doc")
+                md_splits = [doc]
+            
+            # Further split large sections and enrich metadata
+            for md_doc in md_splits:
+                if len(md_doc.page_content) > CHUNK_SIZE:
+                    sub_chunks = text_splitter.split_documents([md_doc])
+                    for chunk in sub_chunks:
+                        enriched_chunk = enrich_chunk_metadata(chunk, filename)
+                        all_chunks.append(enriched_chunk)
+                else:
+                    enriched_chunk = enrich_chunk_metadata(md_doc, filename)
+                    all_chunks.append(enriched_chunk)
+        
+        print(f"  ✓ Processed successfully")
+        
+    except Exception as e:
+        print(f"  ✗ Error processing {filename}: {str(e)}")
+
+print(f"\n{'='*80}")
+print(f"SUMMARY")
+print(f"{'='*80}")
+print(f"Files processed: {len(file_list)}")
+print(f"Total chunks created: {len(all_chunks)}")
+print(f"{'='*80}\n")
+
+# ============================================================================
+# PREVIEW CHUNKS
+# ============================================================================
+
+print("Preview of first 3 chunks:\n")
+for i, chunk in enumerate(all_chunks[:3]):
+    print(f"--- Chunk {i} ---")
+    print(f"Source: {chunk.metadata.get('source_file', 'Unknown')}")
+    print(f"Length: {chunk.metadata.get('chunk_length', 0)} chars")
+    print(f"Section Type: {chunk.metadata.get('section_type', 'N/A')}")
+    print(f"Content: {chunk.page_content[:200]}...")
+    print()
+
+# ============================================================================
+# CREATE VECTOR STORE
+# ============================================================================
+
+print("Creating FAISS vector store...")
+
+# Initialize embeddings
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="models/embedding-001",
+    google_api_key="YOUR_API_KEY"  # Replace with your key
+)
+
+# Create vector store
+vectorstore = FAISS.from_documents(
+    documents=all_chunks,
+    embedding=embeddings
+)
+
+print("✓ Vector store created successfully!")
+
+# Optional: Save the vector store
+# vectorstore.save_local("faiss_gcm_index")
+
+# ============================================================================
+# TEST RETRIEVAL
+# ============================================================================
+
+test_query = "What are the escalation timeframes for ESC2?"
+results = vectorstore.similarity_search(test_query, k=3)
+
+print(f"\n{'='*80}")
+print(f"TEST QUERY: {test_query}")
+print(f"{'='*80}\n")
+
+for i, doc in enumerate(results):
+    print(f"Result {i+1}:")
+    print(f"Source: {doc.metadata.get('source_file', 'Unknown')}")
+    print(f"Content: {doc.page_content[:300]}...")
+    print()
+
+print("✓ Setup complete!")
+

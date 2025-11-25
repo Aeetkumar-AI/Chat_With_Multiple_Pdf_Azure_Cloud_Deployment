@@ -1,0 +1,52 @@
+from langchain.schema import Document
+from typing import List
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+# === MODEL CONFIG ===
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0,
+    max_output_tokens=4096
+)
+
+# === PROMPT ===
+chunk_prompt = """
+You are an expert document-chunking assistant specializing in PCM (Process Control Manual),
+compliance documents, procedural manuals, and technical documentation.
+
+=== CORE OBJECTIVE ===
+Split the input document into semantically meaningful chunks while preserving formatting
+and logical structure.
+
+RULES:
+1. Chunks must be 400–600 words ideally.
+2. Never break inside tables, code blocks, bullet lists, or numbered sections.
+3. Keep section headers with their content.
+4. Do NOT rewrite content.
+5. Output chunks as a JSON list:
+[
+  {"chunk_id": 1, "text": "..."},
+  {"chunk_id": 2, "text": "..."}
+]
+"""
+
+def agentic_chunking(document_text: str, title: str = "Document") -> List[str]:
+    """
+    Calls Gemini to split long documents into structured chunks.
+    Returns a python list of raw chunk strings.
+    """
+    response = llm.invoke([
+        {"role": "system", "content": chunk_prompt},
+        {"role": "user", "content": f"Document Title: {title}\n\nCONTENT:\n{document_text}"}
+    ])
+
+    # model returns a string, so parse carefully
+    import json
+
+    try:
+        chunks_json = json.loads(response.content)
+        return [chunk["text"] for chunk in chunks_json]
+    except Exception:
+        # Fallback — sometimes model returns plain text
+        return [response.content]

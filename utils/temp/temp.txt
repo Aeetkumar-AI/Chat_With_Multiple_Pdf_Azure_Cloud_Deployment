@@ -1,0 +1,289 @@
+# dual_rag_agentic.py
+import os
+import glob
+import json
+import re
+from typing import List
+from langchain.schema import Document, SystemMessage, HumanMessage
+from langchain_community.document_loaders import UnstructuredMarkdownLoader
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_vertexai import VertexAIEmbeddings
+
+# -----------------------
+# CONFIG
+# -----------------------
+DOCUMENTS_DIR = "docs"                    # folder with .md files
+TOP_K = 10                                # top-K per method
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 200
+EMBED_MODEL = "textembedding-gecko@003"   # adjust if needed
+LLM_MODEL = "gemini-2.0-flash"            # model for agentic chunking + answers
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("Set GOOGLE_API_KEY env var before running")
+
+# -----------------------
+# clients
+# -----------------------
+llm = ChatGoogleGenerativeAI(
+    model=LLM_MODEL,
+    google_api_key=GOOGLE_API_KEY,
+    temperature=0
+)
+embeddings = VertexAIEmbeddings(model_name=EMBED_MODEL)
+
+# -----------------------
+# 1) load markdown files
+# -----------------------
+def load_docs(path: str) -> List[Document]:
+    docs = []
+    for file in glob.glob(os.path.join(path, "*.md")):
+        loader = UnstructuredMarkdownLoader(file)
+        for d in loader.load():
+            # ensure metadata source exists
+            d.metadata["source"] = os.path.basename(file)
+            docs.append(d)
+    print(f"[+] Loaded {len(docs)} markdown docs from {path}")
+    return docs
+
+# -----------------------
+# 2) chunking A: headers -> recursive
+# -----------------------
+def chunk_docs_markdown_recursive(docs: List[Document]) -> List[Document]:
+    headers = [
+        ("# ", "H1"),
+        ("## ", "H2"),
+        ("### ", "H3"),
+        ("#### ", "H4"),
+        ("##### ", "H5"),
+        ("###### ", "H6"),
+    ]
+    md_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=headers,
+        strip_headers=False
+    )
+
+    header_chunks = []
+    for d in docs:
+        parts = md_splitter.split_text(d.page_content)
+        for p in parts:
+            # keep source
+            p.metadata["source"] = d.metadata.get("source", "")
+            header_chunks.append(p)
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ".", " "],
+        length_function=len
+    )
+    final_chunks = text_splitter.split_documents(header_chunks)
+    print(f"[+] Markdown->Recursive: produced {len(final_chunks)} chunks")
+    return final_chunks
+
+# -----------------------
+# 3) agentic chunking (LLM-driven, strict JSON expected)
+# -----------------------
+def _extract_json_array(text: str) -> str:
+    """
+    Return substring that is the first valid JSON array found in text,
+    using a simple bracket match approach. None if not found.
+    """
+    start = text.find("[")
+    if start == -1:
+        return None
+    # find matching closing bracket for first '['
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
+
+def agentic_chunking(doc: Document, llm_client) -> List[Document]:
+    """
+    Sends strict instructions to LLM to return JSON array of {chunk_id, content}.
+    Falls back to extracting JSON from LLM output if model adds commentary.
+    Returns list of Document objects (page_content + metadata).
+    """
+    system_message = SystemMessage(content="""You are an expert document-chunking assistant specializing in enterprise documentation.
+
+=== CORE OBJECTIVE ===
+Split documents into chunks that:
+- Maintain complete semantic meaning (no orphaned content)
+- Preserve formatting, tables, lists, and metadata
+- Respect natural boundaries (sections, procedures, workflows)
+- Optimize chunks for vector DB ingestion and RAG retrieval
+
+=== STRICT CHUNKING RULES ===
+NEVER split:
+- Metadata blocks (Version, Owner, etc.)
+- Full Table-of-Contents (keep intact)
+- Any table (keep whole)
+- Complete bullet/numbered lists (keep whole)
+- Step-by-step procedures (keep entire procedure together)
+
+Return ONLY valid JSON array. Format EXACTLY as:
+[
+  { "chunk_id": 1, "content": "<chunk text here>" },
+  { "chunk_id": 2, "content": "<chunk text here>" }
+]
+No extra text, no explanation, no markdown. If you cannot comply, return an empty array [].
+""")
+
+    human_message = HumanMessage(content=f"""Split the following document into semantic chunks and return JSON only:
+
+--- DOCUMENT START ---
+{doc.page_content}
+--- DOCUMENT END ---
+""")
+
+    # invoke LLM - pass messages list (ChatGoogleGenerativeAI supports Chat-style)
+    resp = llm_client.invoke([system_message, human_message])
+    text = getattr(resp, "content", str(resp))
+
+    # try direct parse
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        # attempt to locate JSON substring and parse
+        js = _extract_json_array(text)
+        if js:
+            try:
+                parsed = json.loads(js)
+            except Exception:
+                raise ValueError("Agentic chunker returned malformed JSON after extraction.")
+        else:
+            # final fallback: try to recover JSON-like lines using regex (very last resort)
+            matches = re.findall(r'\{[^}]+\}', text, flags=re.DOTALL)
+            if matches:
+                arr = "[" + ",".join(matches) + "]"
+                try:
+                    parsed = json.loads(arr)
+                except Exception:
+                    raise ValueError("Agentic chunker returned invalid JSON; cannot parse.")
+            else:
+                raise ValueError("Agentic chunker did not return JSON array.")
+
+    out_docs = []
+    for item in parsed:
+        content = item.get("content", "").strip()
+        cid = item.get("chunk_id", None)
+        if content:
+            out_docs.append(Document(page_content=content, metadata={**doc.metadata, "agentic_chunk_id": cid}))
+    return out_docs
+
+def agentic_chunk_all(docs: List[Document], llm_client) -> List[Document]:
+    out = []
+    for i, d in enumerate(docs):
+        try:
+            chunks = agentic_chunking(d, llm_client)
+            out.extend(chunks)
+        except Exception as e:
+            # if agentic chunking fails for a large doc, fallback to recursive split so pipeline continues
+            print(f"[!] Agentic chunking failed for {d.metadata.get('source','<no-src>')}: {e}. Falling back to recursive split.")
+            fallback_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP,
+                separators=["\n\n", "\n", ".", " "],
+                length_function=len
+            )
+            fallback = fallback_splitter.split_text(d.page_content)
+            for idx, chunk_text in enumerate(fallback):
+                out.append(Document(page_content=chunk_text, metadata={**d.metadata, "agentic_fallback_chunk": idx}))
+    print(f"[+] Agentic total chunks (after fallbacks): {len(out)}")
+    return out
+
+# -----------------------
+# 4) build vectorstores
+# -----------------------
+def build_vectorstores(chunksA: List[Document], chunksB: List[Document]):
+    vsA = FAISS.from_documents(chunksA, embeddings)
+    vsB = FAISS.from_documents(chunksB, embeddings)
+    print("[+] Built VectorStore A and B")
+    return vsA, vsB
+
+# -----------------------
+# 5) retrieve from both (similarity + mmr) and dedupe
+# -----------------------
+def retrieve_from_both(query: str, vsA, vsB, k=TOP_K):
+    # A: similarity + mmr
+    rA_sim = vsA.similarity_search(query, k=k)
+    rA_mmr = vsA.max_marginal_relevance_search(query, k=k, fetch_k=k*2, lambda_mult=0.7)
+
+    # B: similarity + mmr
+    rB_sim = vsB.similarity_search(query, k=k)
+    rB_mmr = vsB.max_marginal_relevance_search(query, k=k, fetch_k=k*2, lambda_mult=0.7)
+
+    combined = rA_sim + rA_mmr + rB_sim + rB_mmr
+
+    uniq = []
+    seen = set()
+    for d in combined:
+        txt = d.page_content.strip()
+        if txt not in seen:
+            seen.add(txt)
+            uniq.append(d)
+
+    print(f"[+] Combined unique chunks = {len(uniq)}")
+    # return up to 2*k items (you can change slicing)
+    return uniq[: k * 2]
+
+# -----------------------
+# 6) LLM answer builder
+# -----------------------
+def build_answer_with_llm(query: str, context_docs: List[Document], llm_client) -> str:
+    ctx = "\n\n---\n\n".join(f"[{i+1}] Source: {d.metadata.get('source','')}\n{d.page_content}" for i, d in enumerate(context_docs))
+    prompt = f"""
+You are an expert assistant. Answer the QUESTION using ONLY the CONTEXT below. If the context lacks enough info, respond "Insufficient information."
+
+QUESTION:
+{query}
+
+CONTEXT:
+{ctx}
+"""
+    resp = llm_client.invoke(prompt)
+    return getattr(resp, "content", str(resp))
+
+# -----------------------
+# 7) user API - ask(query)
+# -----------------------
+def ask(query: str) -> str:
+    docs = retrieve_from_both(query, VS_A, VS_B, k=TOP_K)
+    return build_answer_with_llm(query, docs, llm)
+
+# -----------------------
+# 8) bootstrap - build stores once
+# -----------------------
+if __name__ == "__main__":
+    # load
+    raw_docs = load_docs(DOCUMENTS_DIR)
+
+    # chunking A
+    chunksA = chunk_docs_markdown_recursive(raw_docs)
+
+    # chunking B - agentic (LLM)
+    chunksB = agentic_chunk_all(raw_docs, llm)
+
+    # build vector stores
+    VS_A, VS_B = build_vectorstores(chunksA, chunksB)
+
+    print("\n✅ READY — call ask(query) or run interactive prompt below.\n")
+    try:
+        while True:
+            q = input("Query (or 'exit'): ").strip()
+            if not q or q.lower() in ("exit","quit"):
+                break
+            print("\n--- ANSWER ---\n")
+            print(ask(q))
+            print("\n----------------\n")
+    except KeyboardInterrupt:
+        print("\nExiting.")

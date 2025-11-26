@@ -1,0 +1,350 @@
+"""
+Full single-file RAG pipeline:
+- Load markdown
+- Structure-aware chunking (headers -> recursive)
+- Agentic chunking fallback
+- Metadata enrichment (title, headings, keywords per chunk)
+- Build FAISS (dense) + BM25 (sparse)
+- Hierarchical retrieval + query rewriting
+- Hybrid fusion (dense scores + BM25 rank)
+- Final answer builder (temperature=0)
+"""
+
+import os, glob, re, json
+from typing import List, Tuple, Dict
+from collections import Counter
+from langchain.schema import Document, SystemMessage, HumanMessage
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import UnstructuredMarkdownLoader
+from langchain_community.vectorstores import FAISS
+from langchain.retrievers import BM25Retriever
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_vertexai import VertexAIEmbeddings
+
+# ----------------- CONFIG -----------------
+DOCUMENTS_DIR = "Doc"                 # folder containing .md files (change if needed)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("Set GOOGLE_API_KEY env var")
+
+EMBED_MODEL = "textembedding-gecko@003"   # adjust if using different embeddings
+LLM_MODEL = "gemini-2.5-flash"
+TOP_K_DENSE = 25      # first-stage dense retrieval size (hierarchical)
+TOP_K_FINAL = 10      # final returned docs to LLM
+BM25_K = 25
+
+CHUNK_SIZE = 800      # target chunk size (words/characters heuristic)
+CHUNK_OVERLAP = 150
+
+# deterministic LLM usage
+llm = ChatGoogleGenerativeAI(model=LLM_MODEL, google_api_key=GOOGLE_API_KEY, temperature=0)
+embeddings = VertexAIEmbeddings(model_name=EMBED_MODEL)
+
+
+# ----------------- UTIL: extract headings & keywords -----------------
+STOPWORDS = {
+    "the","and","of","to","in","a","for","is","on","with","as","by","an","be","are","this",
+    "that","or","from","it","at","which","will","have","has","not","but","we","our","may"
+}
+
+def extract_headings(text: str) -> List[str]:
+    # find markdown headings
+    lines = text.splitlines()
+    headings = []
+    for L in lines:
+        m = re.match(r'^(#{1,6})\s*(.+)', L)
+        if m:
+            headings.append(m.group(2).strip())
+    return headings
+
+def extract_title(text: str, filename: str) -> str:
+    # prefer first H1, else filename
+    m = re.search(r'^\s*#\s+(.+)', text, flags=re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return os.path.splitext(os.path.basename(filename))[0]
+
+def extract_keywords(text: str, top_n:int=8) -> List[str]:
+    # simple freq-based keyword extraction (stopwords removed, words >=3 chars)
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+    words = [w for w in words if w not in STOPWORDS]
+    counts = Counter(words)
+    common = [w for w,_ in counts.most_common(top_n)]
+    return common
+
+
+# ----------------- 1) Load markdown docs -----------------
+def load_markdown_docs(path: str) -> List[Document]:
+    docs = []
+    for filepath in glob.glob(os.path.join(path, "*.md")):
+        loader = UnstructuredMarkdownLoader(filepath)
+        for d in loader.load():
+            d.metadata.setdefault("source", os.path.basename(filepath))
+            docs.append(d)
+    print(f"[+] Loaded {len(docs)} markdown files")
+    return docs
+
+
+# ----------------- 2) Structure-aware chunking (headers -> recursive) -----------------
+def chunk_markdown_structure(docs: List[Document]) -> List[Document]:
+    headers = [("# ", "H1"), ("## ", "H2"), ("### ", "H3"), ("#### ", "H4"), ("##### ", "H5"), ("###### ", "H6")]
+    md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers, strip_headers=False)
+
+    recursive_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ".", " "],
+        length_function=len
+    )
+
+    out_chunks = []
+    for doc in docs:
+        filename = doc.metadata.get("source", "unknown")
+        try:
+            header_docs = md_splitter.split_text(doc.page_content)
+        except Exception:
+            header_docs = [doc]
+
+        for hdoc in header_docs:
+            # ensure metadata copied
+            hdoc.metadata["source"] = filename
+            # if large, recursively split
+            if len(hdoc.page_content) > CHUNK_SIZE * 2:
+                sub_chunks = recursive_splitter.split_text(hdoc.page_content)
+                for i, text in enumerate(sub_chunks, 1):
+                    out_chunks.append(Document(page_content=text, metadata={**hdoc.metadata, "subchunk_index": i}))
+            else:
+                out_chunks.append(Document(page_content=hdoc.page_content, metadata=hdoc.metadata.copy()))
+    print(f"[+] Structure-aware chunks produced: {len(out_chunks)}")
+    return out_chunks
+
+
+# ----------------- 3) Agentic chunking fallback (optional) -----------------
+def agentic_chunk_fallback(doc: Document) -> List[Document]:
+    # LLM returns chunks delimited by <CHUNK>... </CHUNK>
+    prompt_system = SystemMessage(content="You are an expert document chunker. Output chunks delimited by <CHUNK> ... </CHUNK>. Preserve formatting.")
+    prompt_user = HumanMessage(content=f"Chunk the following document:\n\n{doc.page_content}")
+    resp = llm.invoke([prompt_system, prompt_user])
+    raw = getattr(resp, "content", str(resp))
+    parts = [p.strip().replace("</CHUNK>","") for p in raw.split("<CHUNK>") if p.strip()]
+    out = []
+    for i,p in enumerate(parts,1):
+        out.append(Document(page_content=p, metadata={**doc.metadata, "agentic_chunk_index": i}))
+    return out
+
+
+# ----------------- 4) Metadata enrichment per chunk -----------------
+def enrich_metadata(chunks: List[Document]) -> List[Document]:
+    enriched = []
+    for doc in chunks:
+        source = doc.metadata.get("source", "unknown")
+        # title from doc or filename
+        title = extract_title(doc.page_content, source)
+        headings = extract_headings(doc.page_content)
+        keywords = extract_keywords(doc.page_content, top_n=10)
+        md = dict(doc.metadata)  # copy
+        md.update({
+            "title": title,
+            "headings": headings,
+            "keywords": keywords
+        })
+        enriched.append(Document(page_content=doc.page_content, metadata=md))
+    print(f"[+] Enriched metadata for {len(enriched)} chunks")
+    return enriched
+
+
+# ----------------- 5) Build vectorstores: FAISS (dense) + BM25 (sparse) -----------------
+def build_vectorstores(chunksA: List[Document], chunksB: List[Document]):
+    # combine both chunk sets into vectors optionally or build separate stores
+    # We'll build separate stores (VS_A, VS_B) so you can run cross-store retrieval if needed
+    vsA = FAISS.from_documents(chunksA, embeddings)
+    vsB = FAISS.from_documents(chunksB, embeddings)
+
+    # For BM25, LangChain's BM25Retriever works on a set of documents
+    bm25_A = BM25Retriever.from_documents(chunksA)
+    bm25_B = BM25Retriever.from_documents(chunksB)
+
+    print("[+] Built VS_A, VS_B and BM25 retrievers")
+    return (vsA, bm25_A), (vsB, bm25_B)
+
+
+# ----------------- 6) Query rewriting (LLM) -----------------
+def rewrite_query_with_llm(query: str, top_docs: List[Document]) -> str:
+    # deterministic rewriting: temperature=0
+    # include short excerpts from top_docs to help expand query
+    snippets = "\n\n".join((d.page_content[:800] for d in top_docs[:5]))
+    system = SystemMessage(content="Rewrite the user's question into a precise, keyword-rich search query for document retrieval. Keep it concise, use technical terms and relevant acronyms. No fluff.")
+    user = HumanMessage(content=f"User question: {query}\n\nTopDocSnippets:\n{snippets}\n\nReturn a single-line query (no explanation).")
+    resp = llm.invoke([system, user])
+    return getattr(resp, "content", str(resp)).strip().replace("\n", " ")
+
+
+# ----------------- 7) Dense retrieval with relevance scores -----------------
+def dense_retrieve_with_scores(vs: FAISS, query: str, k:int=TOP_K_DENSE) -> List[Tuple[Document,float]]:
+    # returns list of (Document, score)
+    try:
+        results = vs.similarity_search_with_relevance_scores(query, k=k)
+        # some implementations return (doc, score) tuples
+        return results
+    except Exception:
+        # fallback: similarity_search (no scores)
+        docs = vs.similarity_search(query, k=k)
+        return [(d, 1.0) for d in docs]
+
+
+# ----------------- 8) BM25 retrieval with rank scores (pseudo-score) -----------------
+def bm25_retrieve_with_rank(bm25: BM25Retriever, query: str, k:int=BM25_K) -> List[Tuple[Document, float]]:
+    docs = bm25.get_relevant_documents(query)[:k]
+    # assign pseudo-score based on rank: higher rank => higher score (1.0 .. small)
+    scored = []
+    max_rank = max(1, len(docs))
+    for i,d in enumerate(docs, start=1):
+        score = (max_rank - (i-1)) / max_rank  # 1.0, ... down to ~0
+        scored.append((d, score))
+    return scored
+
+
+# ----------------- 9) Hybrid fusion of dense + BM25 results -----------------
+def hybrid_fusion(dense_results: List[Tuple[Document,float]], bm25_results: List[Tuple[Document,float]], weight_dense=0.7, weight_bm25=0.3, top_n=TOP_K_FINAL) -> List[Document]:
+    # normalize dense scores to 0-1
+    dense_scores = [s for _,s in dense_results] or [1.0]
+    min_s, max_s = min(dense_scores), max(dense_scores)
+    norm_dense = []
+    for d,s in dense_results:
+        if max_s - min_s > 1e-6:
+            ns = (s - min_s) / (max_s - min_s)
+        else:
+            ns = 1.0
+        norm_dense.append((d, ns))
+
+    # create dict of combined scores
+    score_map = {}
+    for d, ns in norm_dense:
+        key = (d.page_content[:200], d.metadata.get("source",""))
+        score_map[key] = score_map.get(key, 0.0) + weight_dense * ns
+
+    for d, bs in bm25_results:
+        key = (d.page_content[:200], d.metadata.get("source",""))
+        score_map[key] = score_map.get(key, 0.0) + weight_bm25 * bs
+
+    # map back to Document objects (prefer dense doc object if available)
+    docs_candidates = {}
+    for d,s in dense_results:
+        key = (d.page_content[:200], d.metadata.get("source",""))
+        docs_candidates[key] = d
+    for d,s in bm25_results:
+        key = (d.page_content[:200], d.metadata.get("source",""))
+        docs_candidates.setdefault(key, d)
+
+    # sort by combined score
+    sorted_keys = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
+    final_docs = []
+    for (key,score) in sorted_keys[:top_n]:
+        final_docs.append(docs_candidates[key])
+
+    return final_docs
+
+
+# ----------------- 10) Hierarchical retrieval orchestrator -----------------
+def hierarchical_retrieve(query: str, vsA_bm25: Tuple, vsB_bm25: Tuple, k_dense=TOP_K_DENSE) -> List[Document]:
+    (vsA, bm25A) = vsA_bm25
+    (vsB, bm25B) = vsB_bm25
+
+    # Stage 0: initial dense retrieval (both stores)
+    denseA = dense_retrieve_with_scores(vsA, query, k=k_dense)
+    denseB = dense_retrieve_with_scores(vsB, query, k=k_dense)
+    # merge top results for query rewriting
+    combined_preview_docs = [d for d,_ in denseA[:6]] + [d for d,_ in denseB[:6]]
+
+    # Stage 1: query rewrite using LLM + previews
+    rewritten = rewrite_query_with_llm(query, combined_preview_docs)
+
+    # Stage 2: re-run dense + BM25 on rewritten query (wider nets)
+    denseA2 = dense_retrieve_with_scores(vsA, rewritten, k=k_dense)
+    denseB2 = dense_retrieve_with_scores(vsB, rewritten, k=k_dense)
+
+    bm25A = bm25_retrieve_with_rank(bm25A, rewritten, k=BM25_K)
+    bm25B = bm25_retrieve_with_rank(bm25B, rewritten, k=BM25_K)
+
+    # Combine dense results and bm25 results across stores
+    dense_combined = denseA2 + denseB2     # list of (doc, score)
+    bm25_combined = bm25A + bm25B          # list of (doc, score)
+
+    # Stage 3: hybrid fusion and dedupe
+    final_docs = hybrid_fusion(dense_combined, bm25_combined, top_n=TOP_K_FINAL)
+    return final_docs
+
+
+# ----------------- 11) Final LLM answer builder (zero creativity) -----------------
+ANSWER_SYSTEM_PROMPT = """
+You are an expert enterprise RAG assistant for compliance & PCM documents.
+Use ONLY the provided context. NEVER hallucinate or invent.
+
+OUTPUT FORMAT:
+1) Short Answer (2-4 lines)
+2) Detailed Steps (if applicable) as numbered list
+3) Exceptions / Notes (if any)
+4) References: list of [source file : first heading / keywords]
+
+If context lacks enough info, respond exactly:
+"I don't have enough information in the provided documents."
+"""
+
+def build_answer(query: str, context_docs: List[Document]) -> str:
+    # build context text with metadata cues for the LLM
+    ctx_blocks = []
+    for i,d in enumerate(context_docs,1):
+        meta = d.metadata
+        md_summary = f"source: {meta.get('source','')}; title: {meta.get('title','')}; headings: {meta.get('headings',[])[:2]}; keywords: {meta.get('keywords',[])[:6]}"
+        ctx_blocks.append(f"[{i}] {md_summary}\n\n{d.page_content}")
+    context_text = "\n\n---\n\n".join(ctx_blocks)
+
+    resp = llm.invoke([
+        SystemMessage(content=ANSWER_SYSTEM_PROMPT),
+        HumanMessage(content=f"Context:\n{context_text}\n\nQuestion:\n{query}\n\nAnswer per format above.")
+    ])
+    return getattr(resp, "content", str(resp))
+
+
+# ----------------- 12) Full pipeline example (build/store indexes optional) -----------------
+def build_and_query_pipeline():
+    # 1. load
+    raw_docs = load_markdown_docs(DOCUMENTS_DIR)
+
+    # 2. chunking A (structure-aware)
+    chunksA = chunk_markdown_structure(raw_docs)
+    chunksA = enrich_metadata(chunksA)
+
+    # 3. chunking B (agentic fallback on original docs) — optional and slower
+    # here we do a quick agentic chunk only when desired; can be skipped
+    chunksB = []
+    for d in raw_docs:
+        try:
+            chunksB.extend(agentic_chunk_fallback(d))
+        except Exception:
+            # fallback to recursive split if agentic fails
+            rsplit = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+            for s in rsplit.split_text(d.page_content):
+                chunksB.append(Document(page_content=s, metadata=d.metadata.copy()))
+    chunksB = enrich_metadata(chunksB)
+
+    # 4. build vectorstores + bm25 retrievers
+    vsA_bm25, vsB_bm25 = build_vectorstores(chunksA, chunksB)
+
+    # 5. ask loop
+    while True:
+        q = input("\nQuery (or 'exit'): ").strip()
+        if not q or q.lower() in ("exit","quit"):
+            break
+        # hierarchical retrieval + hybrid fusion
+        top_docs = hierarchical_retrieve(q, vsA_bm25, vsB_bm25)
+        print(f"[+] Retrieved {len(top_docs)} final docs (feeding to LLM).")
+        ans = build_answer(q, top_docs)
+        print("\n=== ANSWER ===\n")
+        print(ans)
+        print("\n==============\n")
+
+
+# ----------------- Run script -----------------
+if __name__ == "__main__":
+    build_and_query_pipeline()

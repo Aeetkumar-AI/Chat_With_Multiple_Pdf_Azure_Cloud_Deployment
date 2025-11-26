@@ -1,0 +1,20 @@
+from langchain.schema import Document
+import json
+
+def load_chunks(path: str) -> list[Document]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    docs = []
+    for d in data:
+        docs.append(
+            Document(
+                page_content=d["page_content"],
+                metadata=d.get("metadata", {})
+            )
+        )
+    print(f"[✓] Loaded {len(docs)} chunks → {path}")
+    return docs
+
+chunksA_loaded = load_chunks("out_chunks/chunksA_enriched.json")
+chunksB_loaded = load_chunks("out_chunks/chunksB_enriched.json")

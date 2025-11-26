@@ -1,0 +1,5 @@
+Implemented structure-aware document chunking to preserve sections, procedures, and tables.
+	•	Added LLM-based metadata enrichment (topic, business domain, keywords, version, effective date).
+	•	Built dual vector indexes (standard + agentic chunks) to capture different semantic granularities.
+	•	Applied hybrid retrieval (dense + MMR reranking) to surface the most relevant policy context.
+	•	Improved answer accuracy, reduced hallucination, and ensured policy-compliant responses for GCM/PCM queries.

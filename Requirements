@@ -1,0 +1,51 @@
+pip install pymupdf4llm python-docx
+
+#############################
+# UNIVERSAL DOCUMENT LOADER
+#############################
+from langchain.docstore.document import Document
+from pymupdf4llm import PyMuPDFLoader
+from langchain_community.document_loaders import TextLoader
+from docx import Document as DocxReader
+
+def load_any_docs(file_path: str) -> List[Document]:
+    ext = file_path.lower()
+
+    # -------- PDF --------
+    if ext.endswith(".pdf"):
+        loader = PyMuPDFLoader(file_path)
+        docs = loader.load()
+        for d in docs:
+            d.metadata["source_file"] = os.path.basename(file_path)
+        return docs
+
+    # -------- DOCX --------
+    if ext.endswith(".docx"):
+        rd = DocxReader(file_path)
+        raw = "\n".join([p.text for p in rd.paragraphs])
+        return [
+            Document(
+                page_content=raw,
+                metadata={"source_file": os.path.basename(file_path)}
+            )
+        ]
+
+    # -------- TXT --------
+    if ext.endswith(".txt"):
+        loader = TextLoader(file_path, autodetect_encoding=True)
+        docs = loader.load()
+        for d in docs:
+            d.metadata["source_file"] = os.path.basename(file_path)
+        return docs
+
+    # -------- Default → treat as Markdown ----------
+    loader = UnstructuredMarkdownLoader(file_path)
+    docs = loader.load()
+    for d in docs:
+        d.metadata["source_file"] = os.path.basename(file_path)
+    return docs
+
+
+for file in glob.glob(os.path.join(path, "*")):
+    for d in load_any_docs(file):
+        docs.append(d)
